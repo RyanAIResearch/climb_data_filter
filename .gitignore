@@ -1,0 +1,30 @@
+# 排除beifen目录
+beifen/
+
+# 排除data目录
+data/
+
+# 排除fastpass.jsonl文件
+fastpass.jsonl
+
+# 排除大文件
+scored_small.jsonl
+
+# Python缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+
+# IDE配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
