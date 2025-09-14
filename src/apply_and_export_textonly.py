@@ -1,6 +1,6 @@
 """
 Full selector application + 3-phase difficulty-stratified mixed sampling + text_only format export
-Enhanced version with multi-label bucketing, deduplication, and adaptive sampling
+Enhanced version with phase pre-allocation to ensure all phases get data
 """
 import os
 import json
@@ -115,7 +115,8 @@ def sample_bucket_by_difficulty(sorted_rows, token_cap, shard_cb,
                                weights=(0.2, 0.4, 0.4), 
                                dup_policy=True, 
                                force_fc_dup=False,
-                               seen=None):
+                               seen=None,
+                               dup_max=10):  # Added dup_max parameter
     """
     Difficulty-stratified sampling with deduplication and FC oversampling support
     """
@@ -179,7 +180,7 @@ def sample_bucket_by_difficulty(sorted_rows, token_cap, shard_cb,
                             dup = 2
                 
                 # Add to buffer (limit max duplicates per sample)
-                for d in range(min(dup, 10)):
+                for d in range(min(dup, dup_max)):  # Use dup_max instead of hardcoded 10
                     buf.append(r["text"])
                     acc += r["token_count"]
                     local_used += r["token_count"]
@@ -207,7 +208,7 @@ def sample_bucket_by_difficulty(sorted_rows, token_cap, shard_cb,
     
     return local_used
 
-def refill_like(rows, like_key, need_tokens, shard_cb, weights, seen):
+def refill_like(rows, like_key, need_tokens, shard_cb, weights, seen, dup_max=10):
     """Backfill using similar pool"""
     like_pool = [r for r in rows 
                  if r.get(like_key) and r.get("sel_prob", 0) > 0.35
@@ -221,7 +222,8 @@ def refill_like(rows, like_key, need_tokens, shard_cb, weights, seen):
     
     return sample_bucket_by_difficulty(
         like_pool, need_tokens, shard_cb, 
-        weights=weights, dup_policy=True, seen=seen
+        weights=weights, dup_policy=True, seen=seen,
+        dup_max=dup_max  # Pass dup_max parameter
     )
 
 def boost_ratio(base, **boost):
@@ -235,6 +237,18 @@ def boost_ratio(base, **boost):
         return base
     return {k: v/s for k, v in r.items()}
 
+def assign_phase(r, early_frac, mid_frac):
+    """Phase pre-allocation using consistent hash"""
+    sid = int(r.get("simhash", simhash64(r["text"]))) & ((1<<64)-1)
+    # 64-bit multiplication hash → [0,1)
+    u = ((sid * 11400714819323198485) & ((1<<64)-1)) / 2**64
+    if u < early_frac:
+        return "early"
+    elif u < early_frac + mid_frac:
+        return "mid"
+    else:
+        return "late"
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fastpass", required=True)
@@ -243,10 +257,10 @@ def main():
     ap.add_argument("--token_budget", type=int, default=5_000_000_000)
     ap.add_argument("--early_frac", type=float, default=0.30)
     ap.add_argument("--mid_frac", type=float, default=0.40)
-    ap.add_argument("--early_boost_func", type=float, default=2.5)   # Increased
+    ap.add_argument("--early_boost_func", type=float, default=2.5)
     ap.add_argument("--early_boost_reason", type=float, default=1.6)
-    ap.add_argument("--mid_boost_role", type=float, default=1.5)     # Increased
-    ap.add_argument("--mid_boost_rag", type=float, default=1.4)      # Increased
+    ap.add_argument("--mid_boost_role", type=float, default=1.5)
+    ap.add_argument("--mid_boost_rag", type=float, default=1.4)
     ap.add_argument("--val_frac", type=float, default=0.05)
     args = ap.parse_args()
     
@@ -271,6 +285,24 @@ def main():
     for i, r in enumerate(rows):
         r["sel_prob"] = float(probs[i])
     
+    # Phase pre-allocation (NEW)
+    print("Assigning phases to samples...")
+    for r in rows:
+        r["phase"] = assign_phase(r, args.early_frac, args.mid_frac)
+    
+    # Statistics for phase distribution
+    phase_counts = {"early": 0, "mid": 0, "late": 0}
+    phase_tokens = {"early": 0, "mid": 0, "late": 0}
+    for r in rows:
+        phase = r["phase"]
+        phase_counts[phase] += 1
+        phase_tokens[phase] += r["token_count"]
+    
+    print(f"\nPhase distribution:")
+    print(f"  early: {phase_counts['early']:,} samples, {phase_tokens['early']:,} tokens")
+    print(f"  mid: {phase_counts['mid']:,} samples, {phase_tokens['mid']:,} tokens")
+    print(f"  late: {phase_counts['late']:,} samples, {phase_tokens['late']:,} tokens")
+    
     # Multi-label bucketing (allow same sample in multiple buckets)
     buckets = {
         "general": [],
@@ -280,7 +312,7 @@ def main():
         "chatrag": []
     }
     
-    print("Multi-label bucketing...")
+    print("\nMulti-label bucketing...")
     for r in rows:
         has_tag = False
         
@@ -331,20 +363,20 @@ def main():
         if val_texts:
             val_obj = {
                 "type": "text_only",
-                "instances": [{"text": t} for t in val_texts[:10000]]  # cap at 10k
+                "instances": [{"text": t} for t in val_texts[:10000]]
             }
             os.makedirs(args.out_dir, exist_ok=True)
             with open(os.path.join(args.out_dir, "val.json"), "w") as f:
                 json.dump(val_obj, f, ensure_ascii=False)
             print(f"  Saved {len(val_obj['instances'])} validation samples")
     
-    # Ratio settings (maintain FC/RAG proportions)
+    # Ratio settings
     late_ratio = {
         "general": 0.40,
-        "function_calling": 0.18,  # Keep high
+        "function_calling": 0.18,
         "reasoning": 0.17,
-        "roleplay": 0.12,           # Increase
-        "chatrag": 0.13             # Increase
+        "roleplay": 0.12,
+        "chatrag": 0.13
     }
     
     # Apply boost
@@ -365,10 +397,10 @@ def main():
     mid = int(total * args.mid_frac)
     late = total - early - mid
     
-    # Difficulty weights (more balanced)
-    EARLY_WEIGHTS = (0.20, 0.40, 0.40)  # Balanced but still hard-leaning
-    MID_WEIGHTS = (0.25, 0.50, 0.25)    # Focus on medium
-    LATE_WEIGHTS = (0.35, 0.45, 0.20)   # More easy samples
+    # Difficulty weights
+    EARLY_WEIGHTS = (0.20, 0.40, 0.40)
+    MID_WEIGHTS = (0.25, 0.50, 0.25)
+    LATE_WEIGHTS = (0.35, 0.45, 0.20)
     
     # Sampling execution
     print(f"\n=== Starting 3-phase sampling ===")
@@ -388,7 +420,7 @@ def main():
             shard_id += 1
         return cb
     
-    # Three-phase sampling
+    # Three-phase sampling with phase isolation (MODIFIED)
     for phase_name, ratio, cap, weights in [
         ("early", early_ratio, early, EARLY_WEIGHTS),
         ("mid", mid_ratio, mid, MID_WEIGHTS),
@@ -397,6 +429,25 @@ def main():
         print(f"\n{phase_name.upper()} phase:")
         phase_used = 0
         phase_targets = {k: int(cap * v) for k, v in ratio.items()}
+        
+        # Create phase-specific buckets (KEY MODIFICATION)
+        phase_buckets = {
+            k: [r for r in buckets[k] if r.get("phase") == phase_name] 
+            for k in buckets
+        }
+        
+        # Print phase pool sizes
+        print(f"  Phase pool sizes:")
+        for k, v in phase_buckets.items():
+            if len(v) > 0:
+                print(f"    {k}: {len(v):,} samples")
+        
+        # Generate all samples for this phase (for backfill)
+        phase_all_rows = [r for k in phase_buckets for r in phase_buckets[k]]
+        print(f"  Total samples in phase: {len(phase_all_rows):,}")
+        
+        # Dynamic dup_max based on phase
+        phase_dup_max = 10 if phase_name == "early" else (12 if phase_name == "mid" else 14)
         
         for bucket_name, bucket_ratio in ratio.items():
             token_cap = phase_targets[bucket_name]
@@ -407,13 +458,14 @@ def main():
             force_fc = (bucket_name == "function_calling")
             
             got = sample_bucket_by_difficulty(
-                buckets[bucket_name],
+                phase_buckets[bucket_name],  # Use phase_buckets
                 token_cap,
                 make_callback(phase_name),
                 weights=weights,
                 dup_policy=True,
                 force_fc_dup=force_fc,
-                seen=seen_global
+                seen=seen_global,
+                dup_max=phase_dup_max  # Pass phase-specific dup_max
             )
             
             used += got
@@ -423,18 +475,26 @@ def main():
             print(f"  {bucket_name}: {got:,} tokens (target: {token_cap:,})")
             
             # If severely insufficient, use similar backfill
-            if got < token_cap * 0.7:  # Less than 70% of target
+            if got < token_cap * 0.7:
                 need = token_cap - got
                 print(f"    Backfilling {bucket_name} with {need:,} tokens...")
                 
                 if bucket_name == "function_calling":
-                    extra = refill_like(rows, "fc_like", need, 
-                                      make_callback(phase_name), 
-                                      weights, seen_global)
+                    extra = refill_like(
+                        phase_all_rows,  # Use phase_all_rows
+                        "fc_like", need, 
+                        make_callback(phase_name), 
+                        weights, seen_global,
+                        dup_max=phase_dup_max
+                    )
                 elif bucket_name == "chatrag":
-                    extra = refill_like(rows, "rag_like", need,
-                                      make_callback(phase_name),
-                                      weights, seen_global)
+                    extra = refill_like(
+                        phase_all_rows,  # Use phase_all_rows
+                        "rag_like", need,
+                        make_callback(phase_name),
+                        weights, seen_global,
+                        dup_max=phase_dup_max
+                    )
                 else:
                     extra = 0
                 
@@ -447,20 +507,32 @@ def main():
         per_phase[phase_name] = phase_used
         
         # If this phase is not fully used, supplement with general
-        if phase_used < cap * 0.95:  # Allow 5% under-utilization
+        if phase_used < cap * 0.95:
             need = cap - phase_used
             print(f"  Filling remaining {need:,} tokens with general...")
             got = sample_bucket_by_difficulty(
-                buckets["general"],
+                phase_buckets["general"],  # Use phase_buckets
                 need,
                 make_callback(phase_name),
                 weights=weights,
                 dup_policy=False,
-                seen=seen_global
+                seen=seen_global,
+                dup_max=phase_dup_max
             )
             used += got
             per_bucket["general"] += got
             per_phase[phase_name] += got
+    
+    # Calculate phase quality statistics (NEW)
+    phase_quality = {}
+    for phase in ["early", "mid", "late"]:
+        phase_samples = [r for r in rows if r.get("phase") == phase]
+        if phase_samples:
+            phase_quality[phase] = {
+                "mean_prob": float(np.mean([r["sel_prob"] for r in phase_samples])),
+                "sample_count": len(phase_samples),
+                "token_count": sum(r["token_count"] for r in phase_samples)
+            }
     
     # Generate report
     utilization = used / total if total > 0 else 0
@@ -471,6 +543,7 @@ def main():
         "bucket_tokens": dict(per_bucket),
         "bucket_percentages": {k: f"{v/used:.1%}" for k, v in per_bucket.items()} if used > 0 else {},
         "phase_tokens": dict(per_phase),
+        "phase_quality": phase_quality,  # Added phase quality
         "ratios": {
             "early": {k: f"{v:.1%}" for k, v in early_ratio.items()},
             "mid": {k: f"{v:.1%}" for k, v in mid_ratio.items()},
@@ -499,6 +572,12 @@ def main():
     print(f"Unique samples: {len(seen_global):,}")
     print(f"Output dir: {args.out_dir}")
     print(f"Report saved: budget_report.json")
+    
+    # Phase token distribution
+    print(f"\nPhase token distribution:")
+    for phase in ["early", "mid", "late"]:
+        if phase in per_phase:
+            print(f"  {phase}: {per_phase[phase]:,} tokens")
     
     # Warn if utilization is low
     if utilization < 0.8:
